@@ -47,6 +47,46 @@ ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "true").lower() in {
     "yes",
     "on",
 }
+
+ENABLE_LANGUAGE_DETECTION = os.getenv(
+    "ENABLE_LANGUAGE_DETECTION", "true"
+).lower() in {"1", "true", "yes", "on"}
+LANGUAGE_DETECTION_BACKEND = os.getenv("LANGUAGE_DETECTION_BACKEND", "lingua").lower()
+DEFAULT_SOURCE_LANGUAGE = os.getenv("DEFAULT_SOURCE_LANGUAGE", "ind_Latn")
+LANGUAGE_DETECTION_MIN_CONFIDENCE = float(
+    os.getenv("LANGUAGE_DETECTION_MIN_CONFIDENCE", "0.55")
+)
+
+# Restricting the candidate set keeps memory low and accuracy high. Widen it
+# only for languages you actually expect in prompts.
+DETECTION_LANGUAGES = [
+    code.strip().lower()
+    for code in os.getenv("DETECTION_LANGUAGES", "id,en,jv,su,ms").split(",")
+    if code.strip()
+]
+
+# ISO 639-1 -> FLORES-200 codes understood by NLLB.
+ISO_TO_FLORES = {
+    "id": "ind_Latn",
+    "en": "eng_Latn",
+    "jv": "jav_Latn",
+    "su": "sun_Latn",
+    "ms": "zsm_Latn",
+    "ar": "arb_Arab",
+    "de": "deu_Latn",
+    "es": "spa_Latn",
+    "fr": "fra_Latn",
+    "ja": "jpn_Jpan",
+    "ko": "kor_Hang",
+    "nl": "nld_Latn",
+    "pt": "por_Latn",
+    "ru": "rus_Cyrl",
+    "th": "tha_Thai",
+    "tr": "tur_Latn",
+    "vi": "vie_Latn",
+    "zh": "zho_Hans",
+}
+
 PROMPT_SUFFIX = os.getenv(
     "PROMPT_SUFFIX",
     "realistic high-quality field recording, clear isolated foreground sound",
@@ -78,10 +118,113 @@ def load_models():
     return audio_model, translation_tokenizer, translation_model
 
 
+def load_language_detector():
+    """Build a small language detector. Returns None when unavailable.
+
+    Both backends are CPU-only and tiny compared to NLLB, so this adds a
+    negligible amount of startup time and memory.
+    """
+    if not ENABLE_LANGUAGE_DETECTION:
+        return None
+
+    if LANGUAGE_DETECTION_BACKEND == "lingua":
+        try:
+            from lingua import LanguageDetectorBuilder, IsoCode639_1
+        except ImportError:
+            logger.warning(
+                "lingua-language-detector is not installed; "
+                "language detection disabled"
+            )
+            return None
+
+        iso_codes = []
+        for code in DETECTION_LANGUAGES:
+            iso_code = getattr(IsoCode639_1, code.upper(), None)
+            if iso_code is None:
+                logger.warning("Unknown detection language ignored: %s", code)
+                continue
+            iso_codes.append(iso_code)
+
+        if len(iso_codes) < 2:
+            logger.warning("Need at least two detection languages; disabling")
+            return None
+            
+        logger.info("Loading lingua detector for: %s", DETECTION_LANGUAGES)
+        detector = (
+            LanguageDetectorBuilder.from_iso_codes_639_1(*iso_codes)
+            .with_low_accuracy_mode()
+            .build()
+        )
+        logger.info("Language detector ready")
+        return detector
+
+    if LANGUAGE_DETECTION_BACKEND == "langid":
+        try:
+            import py3langid
+        except ImportError:
+            logger.warning("py3langid is not installed; language detection disabled")
+            return None
+
+        identifier = py3langid.langid.LanguageIdentifier.from_pickled_model(
+            py3langid.langid.MODEL_FILE, norm_probs=True
+        )
+        identifier.set_languages(DETECTION_LANGUAGES)
+        logger.info("Language detector ready (py3langid)")
+        return identifier
+
+    logger.warning("Unknown detection backend: %s", LANGUAGE_DETECTION_BACKEND)
+    return None
+
+
 AUDIO_MODEL, TRANSLATION_TOKENIZER, TRANSLATION_MODEL = load_models()
+LANGUAGE_DETECTOR = load_language_detector()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+
+
+def detect_language(text):
+    """Detect the FLORES-200 code of `text`, e.g. 'ind_Latn'.
+
+    Returns (flores_code, confidence). Falls back to DEFAULT_SOURCE_LANGUAGE
+    when detection is off, fails, or is not confident enough. Audio prompts are
+    short, so a wrong-but-confident guess is worse than the default.
+    """
+    if LANGUAGE_DETECTOR is None:
+        return DEFAULT_SOURCE_LANGUAGE, None
+
+    cleaned = " ".join(text.split())
+    if len(cleaned) < 3:
+        return DEFAULT_SOURCE_LANGUAGE, None
+
+    try:
+        if LANGUAGE_DETECTION_BACKEND == "lingua":
+            best = LANGUAGE_DETECTOR.compute_language_confidence_values(cleaned)[0]
+            iso_code = best.language.iso_code_639_1.name.lower()
+            confidence = float(best.value)
+        else:
+            iso_code, confidence = LANGUAGE_DETECTOR.classify(cleaned)
+            confidence = float(confidence)
+    except Exception:
+        logger.exception("Language detection failed; using default")
+        return DEFAULT_SOURCE_LANGUAGE, None
+
+    flores_code = ISO_TO_FLORES.get(iso_code)
+
+    if flores_code is None:
+        logger.info("Detected unmapped language %s; using default", iso_code)
+        return DEFAULT_SOURCE_LANGUAGE, confidence
+
+    if confidence < LANGUAGE_DETECTION_MIN_CONFIDENCE:
+        logger.info(
+            "Low confidence (%s, %.2f); using default %s",
+            iso_code,
+            confidence,
+            DEFAULT_SOURCE_LANGUAGE,
+        )
+        return DEFAULT_SOURCE_LANGUAGE, confidence
+
+    return flores_code, confidence
 
 
 def translate_to_english(text, source_language="ind_Latn"):
@@ -146,7 +289,15 @@ def validate_payload(payload):
     seed = int(payload.get("seed", 42))
     translate = parse_boolean(payload.get("translate"), ENABLE_TRANSLATION)
     enhance = parse_boolean(payload.get("enhance"), True)
-    source_language = str(payload.get("source_language", "ind_Latn")).strip()
+    # Optional: omit it (or send "auto") to detect the language from the prompt.
+    # An explicit value always wins over detection.
+    raw_source_language = payload.get("source_language")
+    source_language = (
+        None
+        if raw_source_language is None
+        or str(raw_source_language).strip().lower() in {"", "auto"}
+        else str(raw_source_language).strip()
+    )
 
     if translate and not ENABLE_TRANSLATION:
         raise ValueError("Translation is disabled on this server")
@@ -187,6 +338,10 @@ def health():
         model=MODEL_NAME,
         device="cuda" if torch.cuda.is_available() else "cpu",
         translation_enabled=ENABLE_TRANSLATION,
+        language_detection_enabled=LANGUAGE_DETECTOR is not None,
+        language_detection_backend=(
+            LANGUAGE_DETECTION_BACKEND if LANGUAGE_DETECTOR is not None else None
+        ),
     )
 
 
@@ -205,13 +360,30 @@ def generate():
 
     try:
         with generation_lock:
-            translated_prompt = (
-                translate_to_english(
-                    params["prompt"], source_language=params["source_language"]
+            if params["source_language"] is None:
+                source_language, detection_confidence = detect_language(
+                    params["prompt"]
                 )
-                if params["translate"]
-                else params["prompt"]
+                language_origin = "detected"
+            else:
+                source_language = params["source_language"]
+                detection_confidence = None
+                language_origin = "client"
+
+            logger.info(
+                "Source language %s (%s, confidence=%s)",
+                source_language,
+                language_origin,
+                detection_confidence,
             )
+
+            # Skip a pointless round trip when the prompt is already English.
+            if not params["translate"] or source_language == "eng_Latn":
+                translated_prompt = params["prompt"]
+            else:
+                translated_prompt = translate_to_english(
+                    params["prompt"], source_language=source_language
+                )
             final_prompt = (
                 enhance_prompt(translated_prompt)
                 if params["enhance"]
@@ -263,6 +435,9 @@ def generate():
             steps=params["steps"],
             guidance_scale=params["guidance_scale"],
             seed=params["seed"],
+            source_language=source_language,
+            source_language_origin=language_origin,
+            source_language_confidence=detection_confidence,
             generation_time_seconds=elapsed,
             audio_path=audio_path,
             audio_url=build_public_url(audio_path),
