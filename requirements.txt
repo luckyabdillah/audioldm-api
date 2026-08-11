@@ -1,7 +1,6 @@
-# Install AudioLDM v1 and its PyTorch dependencies separately first, following
-# the upstream repository instructions. These are the additional API packages.
 Flask==3.0.3
 gunicorn==23.0.0; platform_system != "Windows"
 certifi>=2024.8.30
 soundfile>=0.12.1
 sentencepiece>=0.2.0
+lingua-language-detector>=2.0.2

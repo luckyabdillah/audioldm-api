@@ -57,6 +57,10 @@ pip3 install git+https://github.com/haoheliu/AudioLDM.git
 
 Verify the environment before continuing:
 
+```powershell
+python -c "import torch, audioldm; print(torch.__version__, torch.cuda.is_available())"
+```
+
 The AudioLDM and NLLB checkpoints are **not** installed manually. They are
 downloaded automatically on first run and cached under `HF_HOME` (configure the path in `.env`). Expect several GB and a slow first startup.
 
@@ -71,8 +75,10 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-The development server runs at `http://127.0.0.1:5000`. Confirm it is up with
-`GET /health`.
+This also installs `lingua-language-detector`, used to auto-detect the prompt language. It is small and CPU-only, and only the languages listed in
+`DETECTION_LANGUAGES` are loaded into memory. If it is missing, the API still starts and simply falls back to `DEFAULT_SOURCE_LANGUAGE`.
+
+The development server runs at `http://127.0.0.1:5000`. Confirm it is up with `GET /health`, which also reports whether language detection is active.
 
 Do not run it with the debug reloader: `app.py` can be imported twice, which
 would load both models twice.
@@ -86,7 +92,6 @@ $body = @{
     prompt = "hujan deras di atap seng"
     translate = $true
     enhance = $true
-    source_language = "ind_Latn"
     duration = 5
     steps = 50
     guidance_scale = 2.5
@@ -113,6 +118,9 @@ Example response:
   "steps": 50,
   "guidance_scale": 2.5,
   "seed": 42,
+  "source_language": "ind_Latn",
+  "source_language_origin": "detected",
+  "source_language_confidence": 0.98,
   "generation_time_seconds": 242.73,
   "audio_path": "/media/d6fef84b8f994cd79883bf5c820f99ac.wav",
   "audio_url": "http://127.0.0.1:5000/media/d6fef84b8f994cd79883bf5c820f99ac.wav"
@@ -134,7 +142,7 @@ Invoke-WebRequest `
 | `prompt` | required | Maximum 500 characters |
 | `translate` | `true` | Translate from `source_language` into English |
 | `enhance` | `true` | Append a recording-quality description |
-| `source_language` | `ind_Latn` | NLLB language code |
+| `source_language` | auto-detected | FLORES-200 code such as `ind_Latn`. Omit it, or send `"auto"`, to detect it from the prompt |
 | `duration` | `5` | Multiple of 2.5, maximum 20 seconds |
 | `steps` | `50` | 10 to 200 |
 | `guidance_scale` | `2.5` | 1 to 10 |
@@ -144,6 +152,32 @@ Invoke-WebRequest `
 `n_candidate_gen_per_text` is intentionally locked to `1`. AudioLDM v1 calls
 `waveform.cuda()` when scoring multiple candidates, so it crashes on a CPU-only
 PyTorch build.
+
+### Automatic language detection
+​
+When `source_language` is omitted, the prompt language is detected and mapped to
+the matching FLORES-200 code before translation. An explicit `source_language`
+always wins, so existing clients keep working unchanged.
+
+The response reports what happened:
+​
+- `source_language` — the code actually used
+- `source_language_origin` — `detected` or `client`
+- `source_language_confidence` — `null` when the client supplied the code
+
+​
+Detection falls back to `DEFAULT_SOURCE_LANGUAGE` when the prompt is shorter than 3 characters, the detected language is not in the mapping table, confidence is below `LANGUAGE_DETECTION_MIN_CONFIDENCE`, or the detector is unavailable. Audio prompts are short, so a confident wrong guess is worse than the default. When the prompt is detected as English, the NLLB round trip is skipped entirely.
+​
+Two backends are available:
+​
+| Backend | Install | Notes |
+| --- | --- | --- |
+| `lingua` (default) | `lingua-language-detector` | Built for short text; loads only the languages in `DETECTION_LANGUAGES` |
+| `langid` | `py3langid` | ~2 MB, pure NumPy, weaker on very short prompts |
+
+
+Keep `DETECTION_LANGUAGES` as narrow as realistic. A short prompt like
+`suara hujan` is much easier to classify against 5 candidates than against 75.
 ​
 ## 4. Environment configuration
 ​
@@ -152,6 +186,11 @@ PyTorch build.
 | `AUDIOLDM_MODEL` | `audioldm-m-full` |
 | `ENABLE_TRANSLATION` | `true` |
 | `TRANSLATION_MODEL` | `facebook/nllb-200-distilled-600M` |
+| `ENABLE_LANGUAGE_DETECTION` | `true` |
+| `LANGUAGE_DETECTION_BACKEND` | `lingua` (or `langid`) |
+| `DETECTION_LANGUAGES` | `id,en,jv,su,ms` (ISO 639-1, comma separated) |
+| `DEFAULT_SOURCE_LANGUAGE` | `ind_Latn` |
+| `LANGUAGE_DETECTION_MIN_CONFIDENCE` | `0.55` |
 | `PROMPT_SUFFIX` | high-quality recording description |
 | `OUTPUT_DIR` | `outputs` folder next to `app.py` |
 | `OUTPUT_RETENTION_HOURS` | `24` |
@@ -207,5 +246,11 @@ Adjust the `/opt/miniconda3` path and the `audioldm` user if yours differ.
   API to the internet.
 - NLLB 600M and AudioLDM medium use a lot of RAM. If translation is not needed,
   set `ENABLE_TRANSLATION=false`.
+- Language detection is cheap compared to the other models, but if every prompt
+  is already in one known language, set `ENABLE_LANGUAGE_DETECTION=false` and
+  rely on `DEFAULT_SOURCE_LANGUAGE` instead.
+- Log `source_language_confidence` in production for a while. If low-confidence
+  fallbacks are frequent, narrow `DETECTION_LANGUAGES` before raising the
+  threshold.
 - `PUBLIC_BASE_URL` must use a public HTTPS domain so that `audio_url` is correct
   when the API sits behind Nginx.
