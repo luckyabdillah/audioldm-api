@@ -1,5 +1,6 @@
 import logging
 import os
+import queue
 import re
 import ssl
 import sys
@@ -93,8 +94,19 @@ PROMPT_SUFFIX = os.getenv(
 ).strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# AudioLDM v1 is not safe to run concurrently on one CPU model instance.
-generation_lock = threading.Lock()
+# AudioLDM v1 is not safe to run concurrently on one model instance, so
+# generation happens on a single background worker thread that consumes
+# jobs from this queue one at a time. HTTP requests never block on
+# generation itself; they just enqueue a job and return immediately.
+JOB_QUEUE = queue.Queue()
+
+# In-memory job store: job_id -> job dict. Guarded by JOBS_LOCK because the
+# worker thread and Flask request threads both touch it. Jobs are lost on
+# process restart, which is fine here since a client can simply resubmit.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_MINUTES", "60")) * 60
 
 
 def load_models():
@@ -321,6 +333,152 @@ def build_public_url(relative_path):
     return url_for("serve_audio", filename=Path(relative_path).name, _external=True)
 
 
+def update_job(job_id, **fields):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(fields)
+
+
+def remove_expired_jobs():
+    """Drop finished jobs from memory after JOB_RETENTION_SECONDS.
+
+    Keeps the JOBS dict from growing forever; the .wav files themselves
+    are cleaned up separately by remove_expired_outputs().
+    """
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    with JOBS_LOCK:
+        expired = [
+            job_id
+            for job_id, job in JOBS.items()
+            if job["status"] in {"completed", "failed"}
+            and job.get("finished_at", 0) < cutoff
+        ]
+        for job_id in expired:
+            del JOBS[job_id]
+
+
+def run_generation(job_id, params):
+    """Do the actual model inference for one job. Runs on the worker thread."""
+    update_job(job_id, status="processing", started_at=time.perf_counter())
+    started_at = time.perf_counter()
+
+    try:
+        if params["source_language"] is None:
+            source_language, detection_confidence = detect_language(params["prompt"])
+            language_origin = "detected"
+        else:
+            source_language = params["source_language"]
+            detection_confidence = None
+            language_origin = "client"
+
+        logger.info(
+            "Job %s: source language %s (%s, confidence=%s)",
+            job_id,
+            source_language,
+            language_origin,
+            detection_confidence,
+        )
+
+        # Skip a pointless round trip when the prompt is already English.
+        if not params["translate"] or source_language == "eng_Latn":
+            translated_prompt = params["prompt"]
+        else:
+            translated_prompt = translate_to_english(
+                params["prompt"], source_language=source_language
+            )
+        final_prompt = (
+            enhance_prompt(translated_prompt) if params["enhance"] else translated_prompt
+        )
+
+        waveforms = text_to_audio(
+            latent_diffusion=AUDIO_MODEL,
+            text=final_prompt,
+            seed=params["seed"],
+            ddim_steps=params["steps"],
+            duration=params["duration"],
+            batchsize=1,
+            guidance_scale=params["guidance_scale"],
+            n_candidate_gen_per_text=params["n_candidate_gen_per_text"],
+        )
+
+        audio = np.asarray(waveforms[0, 0], dtype=np.float32)
+        audio = np.clip(audio, -1.0, 1.0)
+
+        filename = f"{job_id}.wav"
+        final_path = OUTPUT_DIR / filename
+        temporary_path = OUTPUT_DIR / f"{job_id}.tmp"
+
+        sf.write(
+            str(temporary_path),
+            audio,
+            samplerate=16000,
+            format="WAV",
+            subtype="PCM_16",
+        )
+        os.replace(str(temporary_path), str(final_path))
+
+        remove_expired_outputs(
+            max_age_hours=int(os.getenv("OUTPUT_RETENTION_HOURS", "24"))
+        )
+
+        elapsed = round(time.perf_counter() - started_at, 2)
+
+        with app.app_context():
+            audio_path = url_for("serve_audio", filename=filename)
+            audio_url = build_public_url(audio_path)
+
+        update_job(
+            job_id,
+            status="completed",
+            finished_at=time.time(),
+            result={
+                "id": job_id,
+                "prompt": params["prompt"],
+                "translated_prompt": translated_prompt,
+                "final_prompt": final_prompt,
+                "duration": params["duration"],
+                "steps": params["steps"],
+                "guidance_scale": params["guidance_scale"],
+                "seed": params["seed"],
+                "source_language": source_language,
+                "source_language_origin": language_origin,
+                "source_language_confidence": detection_confidence,
+                "generation_time_seconds": elapsed,
+                "audio_path": audio_path,
+                "audio_url": audio_url,
+                "n_candidate_gen_per_text": params["n_candidate_gen_per_text"],
+            },
+        )
+
+    except Exception as exc:
+        logger.exception("Job %s: audio generation failed", job_id)
+        update_job(
+            job_id,
+            status="failed",
+            finished_at=time.time(),
+            error="audio generation failed",
+            detail=str(exc),
+        )
+
+
+def worker_loop():
+    """Runs forever on a background thread, processing one job at a time."""
+    logger.info("Generation worker thread started")
+    while True:
+        job_id, params = JOB_QUEUE.get()
+        try:
+            run_generation(job_id, params)
+        finally:
+            JOB_QUEUE.task_done()
+            remove_expired_jobs()
+
+
+# Single background worker: the model can only do one generation at a time
+# anyway, so one thread is all we need. daemon=True so it doesn't block
+# process shutdown.
+threading.Thread(target=worker_loop, daemon=True, name="audioldm-worker").start()
+
+
 def remove_expired_outputs(max_age_hours=24):
     cutoff = time.time() - (max_age_hours * 3600)
     for path in OUTPUT_DIR.glob("*.wav"):
@@ -342,6 +500,7 @@ def health():
         language_detection_backend=(
             LANGUAGE_DETECTION_BACKEND if LANGUAGE_DETECTOR is not None else None
         ),
+        queue_size=JOB_QUEUE.qsize(),
     )
 
 
@@ -356,97 +515,53 @@ def generate():
     except (TypeError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
 
-    started_at = time.perf_counter()
+    job_id = uuid.uuid4().hex
+    queue_position = JOB_QUEUE.qsize()
 
-    try:
-        with generation_lock:
-            if params["source_language"] is None:
-                source_language, detection_confidence = detect_language(
-                    params["prompt"]
-                )
-                language_origin = "detected"
-            else:
-                source_language = params["source_language"]
-                detection_confidence = None
-                language_origin = "client"
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "created_at": time.time(),
+            "params": params,
+        }
 
-            logger.info(
-                "Source language %s (%s, confidence=%s)",
-                source_language,
-                language_origin,
-                detection_confidence,
-            )
+    JOB_QUEUE.put((job_id, params))
 
-            # Skip a pointless round trip when the prompt is already English.
-            if not params["translate"] or source_language == "eng_Latn":
-                translated_prompt = params["prompt"]
-            else:
-                translated_prompt = translate_to_english(
-                    params["prompt"], source_language=source_language
-                )
-            final_prompt = (
-                enhance_prompt(translated_prompt)
-                if params["enhance"]
-                else translated_prompt
-            )
+    logger.info("Job %s queued (position %s)", job_id, queue_position)
 
-            waveforms = text_to_audio(
-                latent_diffusion=AUDIO_MODEL,
-                text=final_prompt,
-                seed=params["seed"],
-                ddim_steps=params["steps"],
-                duration=params["duration"],
-                batchsize=1,
-                guidance_scale=params["guidance_scale"],
-                n_candidate_gen_per_text=params["n_candidate_gen_per_text"],
-            )
+    return jsonify(
+        status="queued",
+        id=job_id,
+        queue_position=queue_position,
+        status_url=url_for("job_status", job_id=job_id),
+    ), 202
 
-        audio = np.asarray(waveforms[0, 0], dtype=np.float32)
-        audio = np.clip(audio, -1.0, 1.0)
 
-        file_id = uuid.uuid4().hex
-        filename = f"{file_id}.wav"
-        final_path = OUTPUT_DIR / filename
-        temporary_path = OUTPUT_DIR / f"{file_id}.tmp"
+@app.get("/api/v1/jobs/<job_id>")
+def job_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
 
-        sf.write(
-            str(temporary_path),
-            audio,
-            samplerate=16000,
-            format="WAV",
-            subtype="PCM_16",
-        )
-        os.replace(str(temporary_path), str(final_path))
+    if job is None:
+        return jsonify(error="job not found"), 404
 
-        remove_expired_outputs(
-            max_age_hours=int(os.getenv("OUTPUT_RETENTION_HOURS", "24"))
+    response = {"id": job["id"], "status": job["status"]}
+
+    if job["status"] == "completed":
+        response.update(job["result"])
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+        response["detail"] = job["detail"]
+    elif job["status"] == "queued":
+        # Position among jobs still waiting (0 = next up).
+        response["queue_position"] = sum(
+            1
+            for j in JOBS.values()
+            if j["status"] == "queued" and j["created_at"] < job["created_at"]
         )
 
-        audio_path = url_for("serve_audio", filename=filename)
-        elapsed = round(time.perf_counter() - started_at, 2)
-
-        return jsonify(
-            status="completed",
-            id=file_id,
-            prompt=params["prompt"],
-            translated_prompt=translated_prompt,
-            final_prompt=final_prompt,
-            duration=params["duration"],
-            steps=params["steps"],
-            guidance_scale=params["guidance_scale"],
-            seed=params["seed"],
-            source_language=source_language,
-            source_language_origin=language_origin,
-            source_language_confidence=detection_confidence,
-            generation_time_seconds=elapsed,
-            audio_path=audio_path,
-            audio_url=build_public_url(audio_path),
-            n_candidate_gen_per_text=params["n_candidate_gen_per_text"],
-        )
-
-    except Exception as exc:
-        logger.exception("Audio generation failed")
-        return jsonify(error="audio generation failed", detail=str(exc)), 500
+    return jsonify(**response)
 
 
 @app.get("/media/<filename>")
