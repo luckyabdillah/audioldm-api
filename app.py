@@ -1,3 +1,5 @@
+import functools
+import hmac
 import logging
 import os
 import queue
@@ -93,6 +95,13 @@ PROMPT_SUFFIX = os.getenv(
     "realistic high-quality field recording, clear isolated foreground sound",
 ).strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# Simple API key auth. Set API_KEYS to one or more comma-separated keys,
+# e.g. API_KEYS="key-for-team-a,key-for-team-b". Leave unset/empty to
+# disable auth entirely (useful for local dev).
+API_KEYS = {
+    key.strip() for key in os.getenv("API_KEYS", "").split(",") if key.strip()
+}
 
 # AudioLDM v1 is not safe to run concurrently on one model instance, so
 # generation happens on a single background worker thread that consumes
@@ -193,6 +202,41 @@ LANGUAGE_DETECTOR = load_language_detector()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+
+
+def _extract_api_key():
+    header_key = request.headers.get("X-API-Key")
+    if header_key:
+        return header_key.strip()
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[len("Bearer "):].strip()
+
+    return None
+
+
+def require_api_key(view_func):
+    """Protects a route with API_KEYS. No-op if API_KEYS is empty (dev mode)."""
+
+    @functools.wraps(view_func)
+    def wrapper(*args, **kwargs):
+        if not API_KEYS:
+            return view_func(*args, **kwargs)
+
+        provided_key = _extract_api_key()
+        if provided_key is None:
+            return jsonify(error="API key required"), 401
+
+        is_valid = any(
+            hmac.compare_digest(provided_key, valid_key) for valid_key in API_KEYS
+        )
+        if not is_valid:
+            return jsonify(error="invalid API key"), 401
+
+        return view_func(*args, **kwargs)
+
+    return wrapper
 
 
 def detect_language(text):
@@ -501,10 +545,12 @@ def health():
             LANGUAGE_DETECTION_BACKEND if LANGUAGE_DETECTOR is not None else None
         ),
         queue_size=JOB_QUEUE.qsize(),
+        auth_enabled=bool(API_KEYS),
     )
 
 
 @app.post("/api/v1/generate")
+@require_api_key
 def generate():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
@@ -539,6 +585,7 @@ def generate():
 
 
 @app.get("/api/v1/jobs/<job_id>")
+@require_api_key
 def job_status(job_id):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
