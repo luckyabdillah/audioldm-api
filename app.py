@@ -468,7 +468,7 @@ def run_generation(job_id, params):
         elapsed = round(time.perf_counter() - started_at, 2)
 
         with app.app_context():
-            audio_path = url_for("serve_audio", filename=filename)
+            audio_path = f"/media/{filename}"
             audio_url = build_public_url(audio_path)
 
         update_job(
