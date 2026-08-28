@@ -15,8 +15,12 @@ import certifi
 import numpy as np
 import soundfile as sf
 import torch
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory, url_for
+from flask_cors import CORS
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 os.environ["HF_HOME"] = os.getenv("HF_CACHE_DIR", str(Path.home() / ".cache" / "huggingface"))
 
@@ -203,6 +207,21 @@ LANGUAGE_DETECTOR = load_language_detector()
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+CORS(
+    app,
+    resources={
+        r"/api/*": {"origins": CORS_ORIGINS},
+        r"/media/*": {"origins": CORS_ORIGINS},
+    },
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    methods=["GET", "POST", "OPTIONS"],
+)
+
 
 def _extract_api_key():
     header_key = request.headers.get("X-API-Key")
@@ -374,7 +393,8 @@ def validate_payload(payload):
 def build_public_url(relative_path):
     if PUBLIC_BASE_URL:
         return f"{PUBLIC_BASE_URL}{relative_path}"
-    return url_for("serve_audio", filename=Path(relative_path).name, _external=True)
+    # Generation runs outside an HTTP request, so url_for cannot infer a host.
+    return relative_path
 
 
 def update_job(job_id, **fields):
@@ -467,9 +487,8 @@ def run_generation(job_id, params):
 
         elapsed = round(time.perf_counter() - started_at, 2)
 
-        with app.app_context():
-            audio_path = f"/media/{filename}"
-            audio_url = build_public_url(audio_path)
+        audio_path = f"/media/{filename}"
+        audio_url = build_public_url(audio_path)
 
         update_job(
             job_id,
