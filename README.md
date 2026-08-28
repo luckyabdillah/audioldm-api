@@ -195,6 +195,7 @@ Keep `DETECTION_LANGUAGES` as narrow as realistic. A short prompt like
 | `OUTPUT_DIR` | `outputs` folder next to `app.py` |
 | `OUTPUT_RETENTION_HOURS` | `24` |
 | `PUBLIC_BASE_URL` | host taken from the request |
+| `CORS_ORIGINS` | `*` (comma-separated; set to your frontend origin(s) in production) |
 | `HOST` | `127.0.0.1` |
 | `PORT` | `5000` |
 
