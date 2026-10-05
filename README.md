@@ -62,7 +62,7 @@ python -c "import torch, audioldm; print(torch.__version__, torch.cuda.is_availa
 ```
 
 The AudioLDM and NLLB checkpoints are **not** installed manually. They are
-downloaded automatically on first run and cached under `HF_HOME` (configure the path in `.env`). Expect several GB and a slow first startup.
+downloaded automatically on first run and cached under `HF_HOME` and `AUDIOLDM_CACHE_DIR` (configure the path in `.env`). Expect several GB and a slow first startup.
 
 ### 2.2 Install the API packages and run
 

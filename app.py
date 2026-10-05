@@ -23,6 +23,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 os.environ["HF_HOME"] = os.getenv("HF_CACHE_DIR", str(Path.home() / ".cache" / "huggingface"))
+os.environ["AUDIOLDM_CACHE_DIR"] = os.getenv("AUDIOLDM_CACHE_DIR", str(Path.home() / ".cache" / "audioldm"))
 
 # AudioLDM v1 downloads checkpoints with urllib. This avoids the
 # ASN1/Windows certificate-store issue seen with older Python builds.
