@@ -9,6 +9,7 @@ import ssl
 import sys
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 
@@ -128,6 +129,7 @@ HISTORY_FILE = Path(
     os.getenv("HISTORY_FILE", str(OUTPUT_DIR / "history.json"))
 ).resolve()
 HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+GENERATION_CONTEXT = threading.local()
 
 
 def load_models():
@@ -211,6 +213,22 @@ def load_language_detector():
 
 AUDIO_MODEL, TRANSLATION_TOKENIZER, TRANSLATION_MODEL = load_models()
 LANGUAGE_DETECTOR = load_language_detector()
+
+
+def install_progress_callback_bridge(audio_model):
+    """Forward a per-job callback through AudioLDM's sample_log method."""
+    original_sample_log = audio_model.sample_log
+
+    def sample_log_with_progress(model, *args, **kwargs):
+        callback = getattr(GENERATION_CONTEXT, "progress_callback", None)
+        if callback is not None:
+            kwargs.setdefault("callback", callback)
+        return original_sample_log(*args, **kwargs)
+
+    audio_model.sample_log = types.MethodType(sample_log_with_progress, audio_model)
+
+
+install_progress_callback_bridge(AUDIO_MODEL)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
@@ -501,7 +519,17 @@ def remove_expired_jobs():
 
 def run_generation(job_id, params):
     """Do the actual model inference for one job. Runs on the worker thread."""
-    update_job(job_id, status="processing", started_at=time.perf_counter())
+    update_job(
+        job_id,
+        status="processing",
+        started_at=time.perf_counter(),
+        progress={
+            "stage": "preparing",
+            "completed_steps": 0,
+            "total_steps": params["steps"],
+            "percent": 0.0,
+        },
+    )
     started_at = time.perf_counter()
 
     try:
@@ -532,16 +560,39 @@ def run_generation(job_id, params):
             enhance_prompt(translated_prompt) if params["enhance"] else translated_prompt
         )
 
-        waveforms = text_to_audio(
-            latent_diffusion=AUDIO_MODEL,
-            text=final_prompt,
-            seed=params["seed"],
-            ddim_steps=params["steps"],
-            duration=params["duration"],
-            batchsize=1,
-            guidance_scale=params["guidance_scale"],
-            n_candidate_gen_per_text=params["n_candidate_gen_per_text"],
-        )
+        update_job(job_id, progress={
+            "stage": "ddim_sampling",
+            "completed_steps": 0,
+            "total_steps": params["steps"],
+            "percent": 0.0,
+        })
+
+        def on_ddim_step(step):
+            completed_steps = min(int(step) + 1, params["steps"])
+            update_job(
+                job_id,
+                progress={
+                    "stage": "ddim_sampling",
+                    "completed_steps": completed_steps,
+                    "total_steps": params["steps"],
+                    "percent": round(completed_steps / params["steps"] * 100, 2),
+                },
+            )
+
+        GENERATION_CONTEXT.progress_callback = on_ddim_step
+        try:
+            waveforms = text_to_audio(
+                latent_diffusion=AUDIO_MODEL,
+                text=final_prompt,
+                seed=params["seed"],
+                ddim_steps=params["steps"],
+                duration=params["duration"],
+                batchsize=1,
+                guidance_scale=params["guidance_scale"],
+                n_candidate_gen_per_text=params["n_candidate_gen_per_text"],
+            )
+        finally:
+            GENERATION_CONTEXT.progress_callback = None
 
         audio = np.asarray(waveforms[0, 0], dtype=np.float32)
         audio = np.clip(audio, -1.0, 1.0)
@@ -589,6 +640,12 @@ def run_generation(job_id, params):
             job_id,
             status="completed",
             finished_at=finished_at,
+            progress={
+                "stage": "completed",
+                "completed_steps": params["steps"],
+                "total_steps": params["steps"],
+                "percent": 100.0,
+            },
             result=result,
         )
         try:
@@ -700,6 +757,12 @@ def generate():
             "status": "queued",
             "created_at": time.time(),
             "params": params,
+            "progress": {
+                "stage": "queued",
+                "completed_steps": 0,
+                "total_steps": params["steps"],
+                "percent": 0.0,
+            },
         }
 
     JOB_QUEUE.put((job_id, params))
@@ -742,6 +805,8 @@ def job_status(job_id):
         return jsonify(error="job not found"), 404
 
     response = {"id": job["id"], "status": job["status"]}
+    if job["status"] in {"queued", "processing", "completed"}:
+        response["progress"] = job.get("progress")
 
     if job["status"] == "completed":
         response.update(job["result"])

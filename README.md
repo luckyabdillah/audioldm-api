@@ -13,6 +13,24 @@ GET  /api/v1/history  -> completed generations history
 ```
 ​
 Generation runs in a single background worker. Requests are accepted until the global active-job limit is reached; additional requests receive `429 Too Many Requests`. On CPU, a job can take several minutes. Gunicorn is configured with a single worker so that the large checkpoints are not loaded multiple times, and with a 30-minute timeout.
+
+`GET /api/v1/jobs/<job_id>` includes live generation progress. During DDIM
+sampling, `completed_steps` and `percent` are updated after each sampler step:
+
+```json
+{
+  "id": "d6fef84b8f994cd79883bf5c820f99ac",
+  "status": "processing",
+  "progress": {
+    "stage": "ddim_sampling",
+    "completed_steps": 17,
+    "total_steps": 50,
+    "percent": 34.0
+  }
+}
+```
+
+The `stage` is `queued`, `preparing`, `ddim_sampling`, or `completed`.
 ​
 ## 1. Directory structure
 ​
