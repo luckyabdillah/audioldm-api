@@ -8,9 +8,11 @@ A ready-to-use Flask API for the first version of AudioLDM. AudioLDM and NLLB ar
 POST /api/v1/generate -> run inference -> save WAV -> JSON audio_url
 GET  /media/<id>.wav  -> serve the WAV file
 GET  /health          -> health check
+GET  /api/v1/queue    -> current queue status
+GET  /api/v1/history  -> completed generations history
 ```
 ​
-This implementation is synchronous to keep it easy to use. On CPU, a request can take several minutes. Gunicorn is configured with a single worker so that the large checkpoints are not loaded multiple times, and with a 30-minute timeout.
+Generation runs in a single background worker. Requests are accepted until the global active-job limit is reached; additional requests receive `429 Too Many Requests`. On CPU, a job can take several minutes. Gunicorn is configured with a single worker so that the large checkpoints are not loaded multiple times, and with a 30-minute timeout.
 ​
 ## 1. Directory structure
 ​
@@ -194,6 +196,8 @@ Keep `DETECTION_LANGUAGES` as narrow as realistic. A short prompt like
 | `PROMPT_SUFFIX` | high-quality recording description |
 | `OUTPUT_DIR` | `outputs` folder next to `app.py` |
 | `OUTPUT_RETENTION_HOURS` | `24` |
+| `HISTORY_FILE` | `outputs/history.json` |
+| `MAX_QUEUE_SIZE` | `10` (queued + processing jobs) |
 | `PUBLIC_BASE_URL` | host taken from the request |
 | `CORS_ORIGINS` | `*` (comma-separated; set to your frontend origin(s) in production) |
 | `HOST` | `127.0.0.1` |
@@ -203,6 +207,65 @@ If you run behind a reverse proxy or custom domain, set the public URL:
 ​
 ```bash
 export PUBLIC_BASE_URL="https://audio.example.com"
+```
+
+### Queue limit and status
+
+`MAX_QUEUE_SIZE` limits the total number of active jobs, including the job
+currently being processed. When the limit is reached, `POST /api/v1/generate`
+returns `429`:
+
+```json
+{
+  "error": "job queue is full",
+  "message": "Try again when an existing job completes",
+  "queued": 10,
+  "processing": 1,
+  "total": 11,
+  "max_queue_size": 11
+}
+```
+
+Use `GET /api/v1/queue` to inspect the current state:
+
+```json
+{
+  "status": "ok",
+  "queued": 10,
+  "processing": 1,
+  "total": 11,
+  "max_queue_size": 11,
+  "available_slots": 0
+}
+```
+
+The queue endpoint follows the same API-key authentication as the generation
+and job-status endpoints.
+
+### Generation history
+
+`GET /api/v1/history` returns completed generations from the last
+`OUTPUT_RETENTION_HOURS` hours. The history is persisted in the JSON file at
+`HISTORY_FILE`, which defaults to `outputs/history.json`. Entries are written
+when generation completes and expired entries are removed when a new entry is
+saved.
+
+Example response:
+
+```json
+{
+  "status": "ok",
+  "count": 1,
+  "retention_hours": 24,
+  "history": [
+    {
+      "id": "d6fef84b8f994cd79883bf5c820f99ac",
+      "prompt": "hujan deras di atap seng",
+      "audio_url": "http://127.0.0.1:5000/media/d6fef84b8f994cd79883bf5c820f99ac.wav",
+      "finished_at": 1760000000.0
+    }
+  ]
+}
 ```
 ​
 ## 5. Gunicorn and systemd deployment

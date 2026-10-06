@@ -1,5 +1,6 @@
 import functools
 import hmac
+import json
 import logging
 import os
 import queue
@@ -121,6 +122,12 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_MINUTES", "60")) * 60
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "10"))
+OUTPUT_RETENTION_HOURS = int(os.getenv("OUTPUT_RETENTION_HOURS", "24"))
+HISTORY_FILE = Path(
+    os.getenv("HISTORY_FILE", str(OUTPUT_DIR / "history.json"))
+).resolve()
+HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 def load_models():
@@ -404,6 +411,76 @@ def update_job(job_id, **fields):
             JOBS[job_id].update(fields)
 
 
+def get_queue_snapshot():
+    with JOBS_LOCK:
+        queued = sum(1 for job in JOBS.values() if job["status"] == "queued")
+        processing = sum(
+            1 for job in JOBS.values() if job["status"] == "processing"
+        )
+
+    total = queued + processing
+    return {
+        "queued": queued,
+        "processing": processing,
+        "total": total,
+        "max_queue_size": MAX_QUEUE_SIZE,
+        "available_slots": max(0, MAX_QUEUE_SIZE - total),
+    }
+
+
+def save_history_entry(entry):
+    cutoff = time.time() - (OUTPUT_RETENTION_HOURS * 3600)
+    temporary_path = HISTORY_FILE.with_suffix(".tmp")
+
+    with JOBS_LOCK:
+        try:
+            with HISTORY_FILE.open("r", encoding="utf-8") as history_file:
+                history = json.load(history_file)
+        except FileNotFoundError:
+            history = []
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read history file; starting a new history")
+            history = []
+
+        if not isinstance(history, list):
+            history = []
+
+        history = [
+            item
+            for item in history
+            if isinstance(item, dict) and item.get("finished_at", 0) >= cutoff
+        ]
+        history.append(entry)
+
+        with temporary_path.open("w", encoding="utf-8") as history_file:
+            json.dump(history, history_file, ensure_ascii=False, indent=2)
+            history_file.write("\n")
+        os.replace(str(temporary_path), str(HISTORY_FILE))
+
+
+def load_history():
+    cutoff = time.time() - (OUTPUT_RETENTION_HOURS * 3600)
+
+    with JOBS_LOCK:
+        try:
+            with HISTORY_FILE.open("r", encoding="utf-8") as history_file:
+                history = json.load(history_file)
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read history file")
+            return []
+
+    if not isinstance(history, list):
+        return []
+
+    return [
+        item
+        for item in history
+        if isinstance(item, dict) and item.get("finished_at", 0) >= cutoff
+    ]
+
+
 def remove_expired_jobs():
     """Drop finished jobs from memory after JOB_RETENTION_SECONDS.
 
@@ -482,37 +559,42 @@ def run_generation(job_id, params):
         )
         os.replace(str(temporary_path), str(final_path))
 
-        remove_expired_outputs(
-            max_age_hours=int(os.getenv("OUTPUT_RETENTION_HOURS", "24"))
-        )
+        remove_expired_outputs(max_age_hours=OUTPUT_RETENTION_HOURS)
 
         elapsed = round(time.perf_counter() - started_at, 2)
 
         audio_path = f"/media/{filename}"
         audio_url = build_public_url(audio_path)
 
+        finished_at = time.time()
+        result = {
+            "id": job_id,
+            "prompt": params["prompt"],
+            "translated_prompt": translated_prompt,
+            "final_prompt": final_prompt,
+            "duration": params["duration"],
+            "steps": params["steps"],
+            "guidance_scale": params["guidance_scale"],
+            "seed": params["seed"],
+            "source_language": source_language,
+            "source_language_origin": language_origin,
+            "source_language_confidence": detection_confidence,
+            "generation_time_seconds": elapsed,
+            "audio_path": audio_path,
+            "audio_url": audio_url,
+            "n_candidate_gen_per_text": params["n_candidate_gen_per_text"],
+            "finished_at": finished_at,
+        }
         update_job(
             job_id,
             status="completed",
-            finished_at=time.time(),
-            result={
-                "id": job_id,
-                "prompt": params["prompt"],
-                "translated_prompt": translated_prompt,
-                "final_prompt": final_prompt,
-                "duration": params["duration"],
-                "steps": params["steps"],
-                "guidance_scale": params["guidance_scale"],
-                "seed": params["seed"],
-                "source_language": source_language,
-                "source_language_origin": language_origin,
-                "source_language_confidence": detection_confidence,
-                "generation_time_seconds": elapsed,
-                "audio_path": audio_path,
-                "audio_url": audio_url,
-                "n_candidate_gen_per_text": params["n_candidate_gen_per_text"],
-            },
+            finished_at=finished_at,
+            result=result,
         )
+        try:
+            save_history_entry(result)
+        except OSError:
+            logger.exception("Job %s completed but history could not be saved", job_id)
 
     except Exception as exc:
         logger.exception("Job %s: audio generation failed", job_id)
@@ -555,6 +637,7 @@ def remove_expired_outputs(max_age_hours=24):
 
 @app.get("/health")
 def health():
+    queue = get_queue_snapshot()
     return jsonify(
         status="ok",
         model=MODEL_NAME,
@@ -564,7 +647,8 @@ def health():
         language_detection_backend=(
             LANGUAGE_DETECTION_BACKEND if LANGUAGE_DETECTOR is not None else None
         ),
-        queue_size=JOB_QUEUE.qsize(),
+        queue_size=queue["queued"],
+        max_queue_size=MAX_QUEUE_SIZE,
         auth_enabled=bool(API_KEYS),
     )
 
@@ -582,9 +666,35 @@ def generate():
         return jsonify(error=str(exc)), 400
 
     job_id = uuid.uuid4().hex
-    queue_position = JOB_QUEUE.qsize()
-
     with JOBS_LOCK:
+        active_jobs = sum(
+            1
+            for job in JOBS.values()
+            if job["status"] in {"queued", "processing"}
+        )
+        if active_jobs >= MAX_QUEUE_SIZE:
+            queue = {
+                "queued": sum(
+                    1 for job in JOBS.values() if job["status"] == "queued"
+                ),
+                "processing": sum(
+                    1 for job in JOBS.values() if job["status"] == "processing"
+                ),
+            }
+            return jsonify(
+                error="job queue is full",
+                message="Try again when an existing job completes",
+                queued=queue["queued"],
+                processing=queue["processing"],
+                total=active_jobs,
+                max_queue_size=MAX_QUEUE_SIZE,
+            ), 429
+
+        queue_position = sum(
+            1
+            for job in JOBS.values()
+            if job["status"] == "queued"
+        )
         JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
@@ -602,6 +712,24 @@ def generate():
         queue_position=queue_position,
         status_url=url_for("job_status", job_id=job_id),
     ), 202
+
+
+@app.get("/api/v1/queue")
+@require_api_key
+def queue_status():
+    return jsonify(status="ok", **get_queue_snapshot())
+
+
+@app.get("/api/v1/history")
+@require_api_key
+def history_status():
+    history = load_history()
+    return jsonify(
+        status="ok",
+        count=len(history),
+        retention_hours=OUTPUT_RETENTION_HOURS,
+        history=history,
+    )
 
 
 @app.get("/api/v1/jobs/<job_id>")
